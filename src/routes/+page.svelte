@@ -18,6 +18,13 @@
 	]);
 
 	let connections = $state<Connection[]>([]);
+	let nextId = 3;
+
+	function createBox() {
+		const id = nextId++;
+		const offset = (boxes.length % 5) * 30;
+		boxes.push({ id, x: 80 + offset, y: 80 + offset });
+	}
 
 	// Box dragging
 	let draggingId = $state<number | null>(null);
@@ -184,6 +191,8 @@
 	});
 </script>
 
+<button class="btn-create" onclick={createBox}>Crear</button>
+
 <div
 	class="workspace"
 	bind:this={workspaceEl}
@@ -230,6 +239,32 @@
 </div>
 
 <style>
+	.btn-create {
+		position: absolute;
+		top: 1.2%;
+		left: 1.2%;
+		padding: 8px 22px;
+		background: rgba(255, 255, 255, 0.12);
+		color: white;
+		border: 1px solid rgba(255, 255, 255, 0.35);
+		border-radius: 8px;
+		font-size: 14px;
+		font-weight: 500;
+		cursor: pointer;
+		backdrop-filter: blur(8px);
+		transition: background 0.2s, border-color 0.2s;
+		z-index: 20;
+	}
+
+	.btn-create:hover {
+		background: rgba(255, 255, 255, 0.22);
+		border-color: rgba(255, 255, 255, 0.6);
+	}
+
+	.btn-create:active {
+		background: rgba(255, 255, 255, 0.3);
+	}
+
 	.workspace {
 		position: absolute;
 		top: 5%;
