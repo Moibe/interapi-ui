@@ -12,13 +12,10 @@
 		toId: number;
 	}
 
-	let boxes = $state<Box[]>([
-		{ id: 1, x: 100, y: 100 },
-		{ id: 2, x: 400, y: 100 }
-	]);
+	let boxes = $state<Box[]>([]);
 
 	let connections = $state<Connection[]>([]);
-	let nextId = 3;
+	let nextId = 1;
 
 	function createBox() {
 		const id = nextId++;
@@ -157,6 +154,33 @@
 		});
 	}
 
+	// Remove box
+	let confirmingBox = $state<Box | null>(null);
+	let confirmPos = $state({ x: 0, y: 0 });
+
+	function removeBox(e: MouseEvent, box: Box) {
+		e.preventDefault();
+		e.stopPropagation();
+		confirmPos = { x: e.clientX, y: e.clientY };
+		confirmingBox = box;
+	}
+
+	function confirmRemoveBox() {
+		if (!confirmingBox) return;
+		for (let i = connections.length - 1; i >= 0; i--) {
+			if (connections[i].fromId === confirmingBox.id || connections[i].toId === confirmingBox.id) {
+				connections.splice(i, 1);
+			}
+		}
+		const idx = boxes.findIndex((b) => b.id === confirmingBox.id);
+		if (idx !== -1) boxes.splice(idx, 1);
+		confirmingBox = null;
+	}
+
+	function cancelRemoveBox() {
+		confirmingBox = null;
+	}
+
 	// Remove connection
 	function removeConnection(index: number) {
 		connections.splice(index, 1);
@@ -214,11 +238,12 @@
 		<div
 			class="box"
 			class:dragging={draggingId === box.id}
-			style="left: {box.x}px; top: {box.y}px;"
+			style="left: {box.x}px; top: {box.y}px; z-index: {box.id};"
 			bind:this={boxEls[box.id]}
 			onpointerdown={(e) => onPointerDown(e, box)}
 			onpointermove={(e) => onPointerMove(e, box)}
 			onpointerup={() => onPointerUp(box)}
+			oncontextmenu={(e) => removeBox(e, box)}
 		>
 			<span
 				class="dot input"
@@ -237,6 +262,20 @@
 		</div>
 	{/each}
 </div>
+
+{#if confirmingBox}
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="modal-overlay" onpointerdown={cancelRemoveBox}>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="modal" style="left: {confirmPos.x}px; top: {confirmPos.y}px;" onpointerdown={(e) => e.stopPropagation()}>
+		<p>¿Eliminar nodo {confirmingBox.id}?</p>
+		<div class="modal-actions">
+			<button class="modal-btn cancel" onclick={cancelRemoveBox}>Cancelar</button>
+			<button class="modal-btn confirm" onclick={confirmRemoveBox}>Eliminar</button>
+		</div>
+	</div>
+</div>
+{/if}
 
 <style>
 	.btn-create {
@@ -322,5 +361,73 @@
 		right: -6px;
 		background: #ff9800;
 		box-shadow: 0 0 6px rgba(255, 152, 0, 0.6);
+	}
+
+	.modal-overlay {
+		position: fixed;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		background: rgba(0, 0, 0, 0.3);
+		z-index: 1000;
+	}
+
+	.modal {
+		position: fixed;
+		transform: translate(10px, 10px);
+		background: rgba(30, 30, 30, 0.95);
+		border: 1px solid rgba(255, 255, 255, 0.2);
+		border-radius: 12px;
+		width: 140px;
+		height: 140px;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 14px;
+		box-shadow: 0 16px 50px rgba(0, 0, 0, 0.6);
+		backdrop-filter: blur(8px);
+	}
+
+	.modal p {
+		color: white;
+		font-size: 13px;
+		margin: 0;
+	}
+
+	.modal-actions {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.modal-btn {
+		padding: 5px 14px;
+		border-radius: 8px;
+		font-size: 12px;
+		font-weight: 500;
+		cursor: pointer;
+		transition: background 0.2s, border-color 0.2s;
+	}
+
+	.modal-btn.cancel {
+		background: rgba(255, 255, 255, 0.1);
+		color: white;
+		border: 1px solid rgba(255, 255, 255, 0.3);
+	}
+
+	.modal-btn.cancel:hover {
+		background: rgba(255, 255, 255, 0.2);
+	}
+
+	.modal-btn.confirm {
+		background: rgba(220, 60, 60, 0.8);
+		color: white;
+		border: 1px solid rgba(220, 60, 60, 0.6);
+	}
+
+	.modal-btn.confirm:hover {
+		background: rgba(220, 60, 60, 1);
 	}
 </style>
