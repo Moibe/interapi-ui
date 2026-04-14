@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import { untrack } from 'svelte';
 	import { animate } from 'animejs';
 	import { parseOpenAPI } from '$lib/openapi';
 
@@ -11,6 +12,10 @@
 		y: number;
 		endpoint?: OpenAPIEndpoint;
 		inputValues: Record<string, string>;
+		specUrl: string;
+		builtRequest?: Record<string, unknown>;
+		workflowStatus: 'idle' | 'loading' | 'ready' | 'error';
+		workflowError?: string;
 	}
 
 	interface Connection {
@@ -37,7 +42,12 @@
 		if (!raw) return;
 		try {
 			const data = JSON.parse(raw);
-			boxes = data.boxes ?? [];
+			boxes = (data.boxes ?? []).map((b: Record<string, unknown>) => ({
+				...b,
+				specUrl: b.specUrl ?? '',
+				workflowStatus: b.builtRequest ? 'ready' : 'idle',
+				workflowError: undefined
+			}));
 			connections = data.connections ?? [];
 			nextId = data.nextId ?? 1;
 		} catch { /* corrupted data, start fresh */ }
@@ -65,9 +75,16 @@
 			reader.onload = () => {
 				try {
 					const data = JSON.parse(reader.result as string);
-					boxes = data.boxes ?? [];
+					boxes = (data.boxes ?? []).map((b: Record<string, unknown>) => ({
+						...b,
+						specUrl: b.specUrl ?? '',
+						workflowStatus: b.builtRequest ? 'ready' : 'idle',
+						workflowError: undefined
+					}));
 					connections = data.connections ?? [];
 					nextId = data.nextId ?? 1;
+					showControls = false;
+					boxFiles = {};
 					saveWorkflow();
 				} catch { console.error('JSON inválido'); }
 			};
@@ -89,7 +106,7 @@
 	function createBox() {
 		const id = nextId++;
 		const offset = (boxes.length % 5) * 30;
-		boxes.push({ id, x: 80 + offset, y: 80 + offset, inputValues: {} });
+		boxes.push({ id, x: 80 + offset, y: 80 + offset, inputValues: {}, specUrl: '', workflowStatus: 'idle' });
 	}
 
 	// Test OpenAPI Parser
@@ -130,7 +147,9 @@
 					x: 80 + offset * 30,
 					y: 80 + offset * 30,
 					endpoint: ep,
-					inputValues: initValues
+					inputValues: initValues,
+					specUrl: testSpecUrl.trim(),
+					workflowStatus: 'idle'
 				});
 			});
 		} catch (error) {
@@ -167,8 +186,7 @@
 	let wiringFromId = $state<number | null>(null);
 	let wireEnd = $state({ x: 0, y: 0 });
 
-	const BOX_SIZE = 250;
-	const HALF = BOX_SIZE / 2;
+	const BOX_SIZE = 280;
 	const DOT_OFFSET = 6;
 
 	function clamp(val: number, min: number, max: number) {
@@ -176,11 +194,82 @@
 	}
 
 	function getOutputPos(box: Box) {
-		return { x: box.x + BOX_SIZE + DOT_OFFSET, y: box.y + HALF };
+		const el = boxEls[box.id];
+		const h = el ? el.offsetHeight : BOX_SIZE;
+		return { x: box.x + BOX_SIZE + DOT_OFFSET, y: box.y + h / 2 };
 	}
 
 	function getInputPos(box: Box) {
-		return { x: box.x, y: box.y + HALF };
+		const el = boxEls[box.id];
+		const h = el ? el.offsetHeight : BOX_SIZE;
+		return { x: box.x, y: box.y + h / 2 };
+	}
+
+	// --- Box file handling (non-persistable) ---
+	let boxFiles = $state<Record<number, Record<string, File>>>({});
+
+	function boxHandleFile(boxId: number, paramName: string, e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (file) {
+			if (!boxFiles[boxId]) boxFiles[boxId] = {};
+			boxFiles[boxId][paramName] = file;
+			const box = boxes.find(b => b.id === boxId);
+			if (box) box.inputValues[paramName] = `@${file.name}`;
+		}
+	}
+
+	function boxRemoveFile(boxId: number, paramName: string) {
+		if (boxFiles[boxId]) {
+			const { [paramName]: _, ...rest } = boxFiles[boxId];
+			boxFiles[boxId] = rest;
+		}
+		const box = boxes.find(b => b.id === boxId);
+		if (box) box.inputValues[paramName] = '';
+	}
+
+	async function prepararBox(box: Box) {
+		if (!box.endpoint || !box.specUrl) return;
+		box.workflowStatus = 'loading';
+		box.workflowError = undefined;
+		try {
+			const resp = await fetch(`${MANIFIESTO_API}/manifiesto`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					openapi_url: box.specUrl,
+					endpoint_path: box.endpoint.path,
+					method: box.endpoint.method.toUpperCase()
+				})
+			});
+			if (!resp.ok) {
+				let detail = `Error ${resp.status}: ${resp.statusText}`;
+				try {
+					const body = await resp.json();
+					if (body.detail) {
+						detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail, null, 2);
+					}
+				} catch {}
+				throw new Error(detail);
+			}
+			box.builtRequest = await resp.json();
+			box.workflowStatus = 'ready';
+			box.workflowError = undefined;
+		} catch (err: any) {
+			box.workflowStatus = 'error';
+			box.workflowError = err.message || 'Error desconocido';
+		}
+	}
+
+	function downloadBuiltRequest(box: Box) {
+		if (!box.builtRequest) return;
+		const blob = new Blob([JSON.stringify(box.builtRequest, null, 2)], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `built-request-${box.id}.json`;
+		a.click();
+		URL.revokeObjectURL(url);
 	}
 
 	function buildCurve(x1: number, y1: number, x2: number, y2: number) {
@@ -351,13 +440,124 @@
 
 	// --- Pruebas: Manifiesto ---
 	const MANIFIESTO_API = 'https://moibe-blackbox-manifiesto.hf.space';
-	let pruebasSubtab = $state<'manifiesto' | 'llena' | 'construye'>('manifiesto');
+	let pruebasSubtab = $state<'manifiesto' | 'carga' | 'llena' | 'construye' | 'blackbox'>('manifiesto');
+	let subtabUnlocked = $state<Record<string, boolean>>({ manifiesto: true, carga: true, construye: true, llena: false, blackbox: false });
+
+	// Subtab flow diagram
+	let subtabsWrapperEl: HTMLDivElement;
+	let subtabsSvgEl: SVGSVGElement;
+	let subtabEls = $state<Record<string, HTMLButtonElement | undefined>>({});
+
+	function drawSubtabLines() {
+		if (!subtabsSvgEl) return;
+		// Wait until all buttons are mounted
+		const keys = ['manifiesto', 'carga', 'llena', 'blackbox', 'construye'];
+		if (keys.some(k => !subtabEls[k])) return;
+
+		const svgRect = subtabsSvgEl.getBoundingClientRect();
+		subtabsSvgEl.setAttribute('width', String(svgRect.width));
+		subtabsSvgEl.setAttribute('height', String(svgRect.height));
+		subtabsSvgEl.innerHTML = '';
+
+		// Arrow marker
+		const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+		const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+		marker.setAttribute('id', 'subtab-arrow');
+		marker.setAttribute('viewBox', '0 0 10 6');
+		marker.setAttribute('refX', '9');
+		marker.setAttribute('refY', '3');
+		marker.setAttribute('markerWidth', '8');
+		marker.setAttribute('markerHeight', '6');
+		marker.setAttribute('orient', 'auto');
+		const arrowPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+		arrowPath.setAttribute('d', 'M0,0 L10,3 L0,6');
+		arrowPath.setAttribute('fill', 'rgba(255,255,255,0.4)');
+		marker.appendChild(arrowPath);
+		defs.appendChild(marker);
+		subtabsSvgEl.appendChild(defs);
+
+		const edges: [string, string][] = [
+			['manifiesto', 'llena'],
+			['carga', 'llena'],
+			['llena', 'blackbox'],
+			['construye', 'blackbox']
+		];
+
+		const GAP = 10; // px gap before target button so arrowhead stays visible
+
+		for (const [from, to] of edges) {
+			const a = subtabEls[from];
+			const b = subtabEls[to];
+			if (!a || !b) continue;
+			const ar = a.getBoundingClientRect();
+			const br = b.getBoundingClientRect();
+			const x1 = ar.right - svgRect.left;
+			const y1 = ar.top + ar.height / 2 - svgRect.top;
+			const x2 = br.left - svgRect.left - GAP;
+			const y2 = br.top + br.height / 2 - svgRect.top;
+			const dx = Math.abs(x2 - x1) * 0.6;
+			const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+			path.setAttribute('d', `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`);
+			path.setAttribute('marker-end', 'url(#subtab-arrow)');
+			subtabsSvgEl.appendChild(path);
+		}
+	}
+
+	$effect(() => {
+		// re-run when tab becomes active
+		if (activeTab === 'pruebas') {
+			// tick to ensure DOM is rendered
+			requestAnimationFrame(drawSubtabLines);
+		}
+	});
+
 	let manifiestoUrl = $state('https://moibe-rad.hf.space/openapi.json');
 	let manifiestoPath = $state('');
 	let manifiestoMethod = $state('');
 	let manifiestoResult = $state<object | null>(null);
 	let manifiestoLoading = $state(false);
 	let manifiestoError = $state('');
+
+	// --- Pruebas: Carga Manifiesto ---
+	let cargaError = $state('');
+	let cargaFile = $state<File | null>(null);
+	let cargaFileInput: HTMLInputElement;
+
+	function cargarManifiesto(e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		cargaError = '';
+		cargaFile = file;
+		const reader = new FileReader();
+		reader.onload = () => {
+			try {
+				const text = reader.result as string;
+				const parsed = JSON.parse(text);
+				// Validate manifiesto structure
+				if (!parsed.url || !parsed.method || !Array.isArray(parsed.parameters)) {
+					cargaError = 'El JSON no tiene estructura de manifiesto. Se requieren al menos: url, method y parameters.';
+					cargaFile = null;
+					return;
+				}
+				llenaTemplate = text;
+				llenaFromCarga = true;
+				subtabUnlocked.llena = true;
+				pruebasSubtab = 'llena';
+			} catch {
+				cargaError = 'El archivo no contiene JSON válido.';
+				cargaFile = null;
+			}
+		};
+		reader.onerror = () => { cargaError = 'Error al leer el archivo.'; cargaFile = null; };
+		reader.readAsText(file);
+	}
+
+	function cargaRemoveFile() {
+		cargaFile = null;
+		cargaError = '';
+		if (cargaFileInput) cargaFileInput.value = '';
+	}
 
 	// Reuse endpoint listing for Pruebas tab
 	let pruebasEndpoints = $state<Array<{path: string; method: string; summary?: string; content_type?: string}>>([]);
@@ -408,12 +608,26 @@
 
 			// Auto-populate Llena subtab
 			llenaTemplate = JSON.stringify(manifiestoResult, null, 2);
-			if (pruebasSelectedEp?.content_type) {
-				const ct = pruebasSelectedEp.content_type;
-				if (ct.includes('multipart')) llenaBodyType = 'multipart';
-				else if (ct.includes('form-urlencoded')) llenaBodyType = 'form';
-				else llenaBodyType = 'json';
+			llenaFromCarga = false;
+			// Detect body_type: first from dropdown selection, then from parser
+			let detectedCt = pruebasSelectedEp?.content_type;
+			if (!detectedCt) {
+				try {
+					const parsed = await parseOpenAPI(manifiestoUrl.trim(), manifiestoPath.trim(), manifiestoMethod.trim());
+					detectedCt = parsed.endpoints[0]?.request_body?.content_type;
+				} catch { /* fallback to json */ }
 			}
+			if (detectedCt) {
+				if (detectedCt.includes('multipart')) llenaBodyType = 'multipart';
+				else if (detectedCt.includes('form-urlencoded')) llenaBodyType = 'form';
+				else llenaBodyType = 'json';
+			} else {
+				llenaBodyType = 'json';
+			}
+
+			// Navigate to Llena subtab
+			subtabUnlocked.llena = true;
+			pruebasSubtab = 'llena';
 		} catch (err: any) {
 			manifiestoError = err.message || 'Error desconocido';
 		} finally {
@@ -433,16 +647,82 @@
 	}
 
 	// --- Pruebas: Llena ---
+	interface LlenaParam {
+		name: string;
+		location: string;
+		type: string;
+		required: boolean;
+		description?: string | null;
+	}
+
 	let llenaTemplate = $state('');
+	let llenaTemplateEl: HTMLTextAreaElement;
+	let llenaFromCarga = $state(false);
 	let llenaBodyType = $state('json');
-	let llenaValues = $state('');
+	let llenaParamValues = $state<Record<string, string>>({});
+	let llenaFiles = $state<Record<string, File>>({});
 	let llenaResult = $state<object | null>(null);
 	let llenaLoading = $state(false);
 	let llenaError = $state('');
 
+	let llenaParams = $derived.by<LlenaParam[]>(() => {
+		if (!llenaTemplate.trim()) return [];
+		try {
+			const t = JSON.parse(llenaTemplate.trim());
+			return Array.isArray(t.parameters) ? t.parameters : [];
+		} catch { return []; }
+	});
+
+	function isFileParam(param: LlenaParam): boolean {
+		return param.type === 'file' ||
+			param.type === 'binary' ||
+			(param.location === 'body' && llenaBodyType === 'multipart');
+	}
+
+	$effect(() => {
+		const keys = llenaParams.map((p: LlenaParam) => p.name);
+		const prev = untrack(() => llenaParamValues);
+		const prevFiles = untrack(() => llenaFiles);
+		const next: Record<string, string> = {};
+		keys.forEach((k: string) => { next[k] = prev[k] ?? ''; });
+		llenaParamValues = next;
+		// Clean up files for params that no longer exist
+		const paramNames = new Set(keys);
+		const cleanedFiles: Record<string, File> = {};
+		Object.keys(prevFiles).forEach(k => { if (paramNames.has(k)) cleanedFiles[k] = prevFiles[k]; });
+		llenaFiles = cleanedFiles;
+	});
+
+	$effect(() => {
+		llenaTemplate;
+		tick().then(() => { if (llenaTemplateEl) { llenaTemplateEl.style.height = 'auto'; llenaTemplateEl.style.height = (llenaTemplateEl.scrollHeight + 4) + 'px'; } });
+	});
+
+	function llenaHandleFile(paramName: string, e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (file) {
+			llenaFiles = { ...llenaFiles, [paramName]: file };
+			llenaParamValues[paramName] = `@${file.name}`;
+		}
+	}
+
+	function llenaRemoveFile(paramName: string) {
+		const { [paramName]: _, ...rest } = llenaFiles;
+		llenaFiles = rest;
+		llenaParamValues[paramName] = '';
+	}
+
 	async function ejecutarLlena() {
 		if (!llenaTemplate.trim()) {
-			llenaError = 'Pega la plantilla (JSON del manifiesto).';
+			llenaError = 'Plantilla vacía.';
+			return;
+		}
+		const missing = llenaParams
+			.filter((p: LlenaParam) => p.required && !(llenaParamValues[p.name] ?? '').trim())
+			.map((p: LlenaParam) => p.name);
+		if (missing.length) {
+			llenaError = `Campos obligatorios vacíos: ${missing.join(', ')}`;
 			return;
 		}
 		llenaLoading = true;
@@ -450,13 +730,29 @@
 		llenaResult = null;
 		try {
 			const template = JSON.parse(llenaTemplate.trim());
-			const values = llenaValues.trim() ? JSON.parse(llenaValues.trim()) : {};
+			const values: Record<string, unknown> = {};
+			llenaParams.forEach((p: LlenaParam) => {
+				const raw = llenaParamValues[p.name] ?? '';
+				if (raw === '') return;
+				if (p.type === 'integer' || p.type === 'number') values[p.name] = Number(raw);
+				else if (p.type === 'boolean') values[p.name] = raw === 'true';
+				else values[p.name] = raw;
+			});
 			const resp = await fetch(`${MANIFIESTO_API}/llena`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ template, body_type: llenaBodyType, values })
 			});
-			if (!resp.ok) throw new Error(`Error ${resp.status}: ${resp.statusText}`);
+			if (!resp.ok) {
+				let detail = `Error ${resp.status}: ${resp.statusText}`;
+				try {
+					const body = await resp.json();
+					if (body.detail) {
+						detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail, null, 2);
+					}
+				} catch {}
+				throw new Error(detail);
+			}
 			llenaResult = await resp.json();
 		} catch (err: any) {
 			llenaError = err.message || 'Error desconocido';
@@ -474,6 +770,254 @@
 		a.download = 'manifiesto-lleno.json';
 		a.click();
 		URL.revokeObjectURL(url);
+	}
+
+	// --- Pruebas: Construye ---
+	let construyeUrl = $state('https://moibe-rad.hf.space/openapi.json');
+	let construyePath = $state('');
+	let construyeMethod = $state('');
+	let construyeBodyType = $state('json');
+	let construyeTemplate = $state('');  // hidden, fetched silently for param parsing
+	let construyeParamValues = $state<Record<string, string>>({});
+	let construyeFiles = $state<Record<string, File>>({});
+	let construyeResult = $state<object | null>(null);
+	let construyeLoading = $state(false);
+	let construyeError = $state('');
+	let construyeEndpoints = $state<Array<{path: string; method: string; summary?: string; content_type?: string}>>([]);
+	let construyeDropdownOpen = $state(false);
+	let construyeSelectedEp = $state<{path: string; method: string; summary?: string; content_type?: string} | null>(null);
+
+	let construyeParams = $derived.by<LlenaParam[]>(() => {
+		if (!construyeTemplate.trim()) return [];
+		try {
+			const t = JSON.parse(construyeTemplate.trim());
+			return Array.isArray(t.parameters) ? t.parameters : [];
+		} catch { return []; }
+	});
+
+	function isConstruyeFileParam(param: LlenaParam): boolean {
+		return param.type === 'file' ||
+			param.type === 'binary' ||
+			(param.location === 'body' && construyeBodyType === 'multipart');
+	}
+
+	$effect(() => {
+		const keys = construyeParams.map((p: LlenaParam) => p.name);
+		const prev = untrack(() => construyeParamValues);
+		const prevFiles = untrack(() => construyeFiles);
+		const next: Record<string, string> = {};
+		keys.forEach((k: string) => { next[k] = prev[k] ?? ''; });
+		construyeParamValues = next;
+		const paramNames = new Set(keys);
+		const cleanedFiles: Record<string, File> = {};
+		Object.keys(prevFiles).forEach(k => { if (paramNames.has(k)) cleanedFiles[k] = prevFiles[k]; });
+		construyeFiles = cleanedFiles;
+	});
+
+	function construyeHandleFile(paramName: string, e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (file) {
+			construyeFiles = { ...construyeFiles, [paramName]: file };
+			construyeParamValues[paramName] = `@${file.name}`;
+		}
+	}
+
+	function construyeRemoveFile(paramName: string) {
+		const { [paramName]: _, ...rest } = construyeFiles;
+		construyeFiles = rest;
+		construyeParamValues[paramName] = '';
+	}
+
+	async function listarEndpointsConstruye() {
+		if (!construyeUrl.trim()) return;
+		try {
+			const result = await parseOpenAPI(construyeUrl.trim());
+			construyeEndpoints = result.endpoints.map(ep => ({ path: ep.path, method: ep.method, summary: ep.summary, content_type: ep.request_body?.content_type }));
+			construyePath = '';
+			construyeMethod = '';
+			construyeSelectedEp = null;
+			construyeDropdownOpen = false;
+			construyeTemplate = '';
+		} catch (error) {
+			console.error('Error listando endpoints (construye):', error);
+		}
+	}
+
+	async function selectConstruyeEndpoint(ep: {path: string; method: string; summary?: string; content_type?: string}) {
+		construyeSelectedEp = ep;
+		construyePath = ep.path;
+		construyeMethod = ep.method;
+		construyeDropdownOpen = false;
+		// Auto-detect body_type
+		if (ep.content_type) {
+			if (ep.content_type.includes('multipart')) construyeBodyType = 'multipart';
+			else if (ep.content_type.includes('form-urlencoded')) construyeBodyType = 'form';
+			else construyeBodyType = 'json';
+		}
+		// Silently fetch template to get parameter list
+		try {
+			const resp = await fetch(`${MANIFIESTO_API}/manifiesto`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ openapi_url: construyeUrl.trim(), endpoint_path: ep.path, method: ep.method.toUpperCase() })
+			});
+			if (resp.ok) {
+				const tmpl = await resp.json();
+				construyeTemplate = JSON.stringify(tmpl, null, 2);
+			}
+		} catch (err) {
+			console.error('Error obteniendo template para construye:', err);
+		}
+	}
+
+	async function ejecutarConstruye() {
+		if (!construyeUrl.trim() || !construyePath.trim() || !construyeMethod.trim()) {
+			construyeError = 'Completa URL, endpoint y método.';
+			return;
+		}
+		const missing = construyeParams
+			.filter((p: LlenaParam) => p.required && !(construyeParamValues[p.name] ?? '').trim())
+			.map((p: LlenaParam) => p.name);
+		if (missing.length) {
+			construyeError = `Campos obligatorios vacíos: ${missing.join(', ')}`;
+			return;
+		}
+		construyeLoading = true;
+		construyeError = '';
+		construyeResult = null;
+		try {
+			const values: Record<string, unknown> = {};
+			construyeParams.forEach((p: LlenaParam) => {
+				const raw = construyeParamValues[p.name] ?? '';
+				if (raw === '') return;
+				if (p.type === 'integer' || p.type === 'number') values[p.name] = Number(raw);
+				else if (p.type === 'boolean') values[p.name] = raw === 'true';
+				else values[p.name] = raw;
+			});
+			const payload: Record<string, unknown> = {
+				openapi_url: construyeUrl.trim(),
+				endpoint_path: construyePath.trim(),
+				method: construyeMethod.trim().toUpperCase(),
+				body_type: construyeBodyType
+			};
+			if (Object.keys(values).length > 0) payload.values = values;
+			const resp = await fetch(`${MANIFIESTO_API}/construye`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload)
+			});
+			if (!resp.ok) throw new Error(`Error ${resp.status}: ${resp.statusText}`);
+			construyeResult = await resp.json();
+
+			// Auto-populate Api Blackbox
+			bbManifiesto = JSON.stringify(construyeResult, null, 2);
+			bbFiles = { ...construyeFiles };
+		} catch (err: any) {
+			construyeError = err.message || 'Error desconocido';
+		} finally {
+			construyeLoading = false;
+		}
+	}
+
+	function descargarConstruye() {
+		if (!construyeResult) return;
+		const blob = new Blob([JSON.stringify(construyeResult, null, 2)], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = 'manifiesto-construido.json';
+		a.click();
+		URL.revokeObjectURL(url);
+	}
+
+	// --- Pruebas: Api Blackbox ---
+	let bbManifiesto = $state('');
+	let bbManifiestoEl: HTMLTextAreaElement;
+	let bbFiles = $state<Record<string, File>>({});
+	let bbResult = $state<object | string | null>(null);
+	let bbResultType = $state<'json' | 'image' | 'text'>('json');
+	let bbResultImageUrl = $state('');
+	let bbLoading = $state(false);
+	let bbError = $state('');
+	let bbFileInput: HTMLInputElement;
+
+	// Auto-populate from Llena result
+	$effect(() => {
+		if (llenaResult) {
+			bbManifiesto = JSON.stringify(llenaResult, null, 2);
+			bbFiles = { ...untrack(() => llenaFiles) };
+		}
+	});
+
+	$effect(() => {
+		bbManifiesto;
+		tick().then(() => { if (bbManifiestoEl) { bbManifiestoEl.style.height = 'auto'; bbManifiestoEl.style.height = (bbManifiestoEl.scrollHeight + 4) + 'px'; } });
+	});
+
+	function bbHandleFile(fieldName: string, e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (file) {
+			bbFiles = { ...bbFiles, [fieldName]: file };
+		}
+	}
+
+	function bbRemoveFile(fieldName: string) {
+		const { [fieldName]: _, ...rest } = bbFiles;
+		bbFiles = rest;
+	}
+
+	const BLACKBOX_API = 'https://moibe-api-blackbox.hf.space';
+
+	async function bbEjecutar() {
+		if (!bbManifiesto.trim()) {
+			bbError = 'Pega el manifiesto lleno.';
+			return;
+		}
+		bbLoading = true;
+		bbError = '';
+		bbResult = null;
+		bbResultImageUrl = '';
+		try {
+			const fd = new FormData();
+			fd.append('manifest', bbManifiesto.trim());
+
+			// Add files as 'items'
+			const m = JSON.parse(bbManifiesto.trim());
+			if (m.files) {
+				for (const fref of m.files as Array<{field_name: string; filename: string}>) {
+					const file = bbFiles[fref.field_name];
+					if (file) {
+						fd.append('items', file, fref.filename);
+					}
+				}
+			}
+
+			const resp = await fetch(`${BLACKBOX_API}/procesador`, {
+				method: 'POST',
+				body: fd
+			});
+
+			// Detect response type
+			const ct = resp.headers.get('Content-Type') ?? '';
+			if (ct.includes('image/')) {
+				const blob = await resp.blob();
+				bbResultImageUrl = URL.createObjectURL(blob);
+				bbResultType = 'image';
+				bbResult = { status: resp.status, content_type: ct };
+			} else if (ct.includes('application/json')) {
+				bbResult = await resp.json();
+				bbResultType = 'json';
+			} else {
+				bbResult = await resp.text();
+				bbResultType = 'text';
+			}
+		} catch (err: any) {
+			bbError = err.message || 'Error desconocido';
+		} finally {
+			bbLoading = false;
+		}
 	}
 </script>
 
@@ -501,7 +1045,7 @@
 				</div>
 				<button class="ep-trigger" onclick={() => dropdownOpen = !dropdownOpen}>
 					{#if selectedEndpoint}
-						<span class="ep-trigger-path">{selectedEndpoint.path}</span>
+						<span class="ep-badge method-{selectedEndpoint.method.toLowerCase()}">{selectedEndpoint.method.toUpperCase()}</span><span class="ep-trigger-path">{selectedEndpoint.path}</span>
 					{:else}
 						<span class="ep-placeholder">— Seleccionar endpoint —</span>
 					{/if}
@@ -589,7 +1133,19 @@
 									{#if type === 'boolean'}
 										<input type="checkbox" class="param-checkbox" checked={box.inputValues[`body_${key}`] === 'true'} onchange={(e) => box.inputValues[`body_${key}`] = String(e.currentTarget.checked)} onpointerdown={(e) => e.stopPropagation()} />
 									{:else if type.includes('binary') || type.includes('file')}
-										<input type="file" class="param-file" onpointerdown={(e) => e.stopPropagation()} />
+									{#if boxFiles[box.id]?.[`body_${key}`]}
+										<!-- svelte-ignore a11y_no_static_element_interactions -->
+										<span class="box-file-info" onpointerdown={(e) => e.stopPropagation()}>
+											<span class="box-file-name">{boxFiles[box.id][`body_${key}`].name}</span>
+											<span class="box-file-size">{(boxFiles[box.id][`body_${key}`].size / 1024).toFixed(1)}KB</span>
+											<button class="box-file-remove" onclick={() => boxRemoveFile(box.id, `body_${key}`)} onpointerdown={(e) => e.stopPropagation()}>&times;</button>
+										</span>
+									{:else}
+										<label class="box-file-btn" onpointerdown={(e) => e.stopPropagation()}>
+											Archivo
+											<input type="file" class="box-file-hidden" onchange={(e) => boxHandleFile(box.id, `body_${key}`, e)} />
+										</label>
+									{/if}
 									{:else if type === 'integer' || type === 'number'}
 										<input type="number" class="param-input" placeholder="{type}" bind:value={box.inputValues[`body_${key}`]} onpointerdown={(e) => e.stopPropagation()} />
 									{:else}
@@ -617,7 +1173,29 @@
 						</div>
 					{/each}
 				</div>
+
+				<button
+					class="box-preparar"
+					class:loading={box.workflowStatus === 'loading'}
+					disabled={box.workflowStatus === 'loading'}
+					onclick={() => prepararBox(box)}
+					onpointerdown={(e) => e.stopPropagation()}
+				>
+					{#if box.workflowStatus === 'loading'}
+						Preparando…
+					{:else}
+						Preparar
+					{/if}
+				</button>
 			</div>
+		{#if box.workflowStatus === 'ready'}
+				<span class="box-status-badge box-status-ready" title="Listo para Api Blackbox">✓</span>
+				<button class="box-download-badge" title="Descargar JSON construido" onclick={() => downloadBuiltRequest(box)} onpointerdown={(e) => e.stopPropagation()}>↓</button>
+			{:else if box.workflowStatus === 'error'}
+				<span class="box-status-badge box-status-error" title={box.workflowError ?? 'Error'}>✗</span>
+			{:else if box.workflowStatus === 'loading'}
+				<span class="box-status-badge box-status-loading">⟳</span>
+			{/if}
 			{/if}
 			<span
 				class="dot input"
@@ -641,12 +1219,33 @@
 
 {#if activeTab === 'pruebas'}
 <div class="pruebas-workspace">
-	<nav class="subtabs-bar">
-		<button class="subtab" class:active={pruebasSubtab === 'manifiesto'} onclick={() => pruebasSubtab = 'manifiesto'}>Crea Manifiesto</button>
-		<button class="subtab" class:active={pruebasSubtab === 'llena'} onclick={() => pruebasSubtab = 'llena'}>Llena</button>
-		<button class="subtab" class:active={pruebasSubtab === 'construye'} onclick={() => pruebasSubtab = 'construye'}>Construye</button>
-	</nav>
+	<div class="subtabs-wrapper" bind:this={subtabsWrapperEl}>
+		<svg class="subtabs-lines" bind:this={subtabsSvgEl}></svg>
+		<div class="subtabs-flow">
+			<div class="subtab-node-wrapper subtab-grid-manifiesto">
+				<button class="subtab-node" class:active={pruebasSubtab === 'manifiesto'} onclick={() => pruebasSubtab = 'manifiesto'} bind:this={subtabEls['manifiesto']}>Crea Manifiesto</button>
+				<span class="subtab-info"><span class="subtab-tooltip">Genera una plantilla de manifiesto a partir de una especificación OpenAPI. Selecciona el endpoint y obtén la estructura base para llenar.</span></span>
+			</div>
+			<div class="subtab-node-wrapper subtab-grid-carga">
+				<button class="subtab-node" class:active={pruebasSubtab === 'carga'} onclick={() => pruebasSubtab = 'carga'} bind:this={subtabEls['carga']}>Carga Manifiesto</button>
+				<span class="subtab-info"><span class="subtab-tooltip">Carga un manifiesto existente desde un archivo JSON. Útil para reutilizar plantillas previamente generadas.</span></span>
+			</div>
+			<div class="subtab-node-wrapper subtab-grid-llena">
+				<button class="subtab-node" class:active={pruebasSubtab === 'llena'} class:locked={!subtabUnlocked.llena} onclick={() => { if (subtabUnlocked.llena) pruebasSubtab = 'llena'; }} bind:this={subtabEls['llena']}>Llena</button>
+				<span class="subtab-info"><span class="subtab-tooltip">Rellena la plantilla con valores reales para cada parámetro. Soporta archivos, texto, números y booleanos.</span></span>
+			</div>
+			<div class="subtab-node-wrapper subtab-grid-construye">
+				<button class="subtab-node" class:active={pruebasSubtab === 'construye'} onclick={() => pruebasSubtab = 'construye'} bind:this={subtabEls['construye']}>Construye</button>
+				<span class="subtab-info"><span class="subtab-tooltip">Modo express: combina Crea Manifiesto y Llena en un solo paso. Genera el manifiesto completo directamente desde la especificación.</span></span>
+			</div>
+			<div class="subtab-node-wrapper subtab-grid-blackbox">
+				<button class="subtab-node" class:active={pruebasSubtab === 'blackbox'} class:locked={!subtabUnlocked.blackbox} onclick={() => { if (subtabUnlocked.blackbox) pruebasSubtab = 'blackbox'; }} bind:this={subtabEls['blackbox']}>Api Blackbox</button>
+				<span class="subtab-info"><span class="subtab-tooltip">Ejecuta el manifiesto completo contra la API real. Actúa como proxy que procesa la petición y devuelve la respuesta.</span></span>
+			</div>
+		</div>
+	</div>
 
+	<div class="pruebas-content">
 	{#if pruebasSubtab === 'manifiesto'}
 	<div class="pruebas-form">
 		<div class="pruebas-row">
@@ -666,7 +1265,7 @@
 						</div>
 						<button class="ep-trigger" onclick={() => pruebasDropdownOpen = !pruebasDropdownOpen}>
 							{#if pruebasSelectedEp}
-								<span class="ep-trigger-path">{pruebasSelectedEp.method.toUpperCase()} {pruebasSelectedEp.path}</span>
+								<span class="ep-badge method-{pruebasSelectedEp.method.toLowerCase()}">{pruebasSelectedEp.method.toUpperCase()}</span><span class="ep-trigger-path">{pruebasSelectedEp.path}</span>
 							{:else}
 								<span class="ep-placeholder">— Seleccionar endpoint —</span>
 							{/if}
@@ -685,7 +1284,6 @@
 					</div>
 				{:else}
 					<input class="pruebas-input pruebas-input--short" bind:value={manifiestoPath} placeholder="/endpoint" />
-					<input class="pruebas-input pruebas-input--method" bind:value={manifiestoMethod} placeholder="POST" />
 				{/if}
 			</div>
 		</div>
@@ -706,20 +1304,96 @@
 	</div>
 	{/if}
 
+	{#if pruebasSubtab === 'carga'}
+	<div class="pruebas-form">
+		<div class="llena-params">
+			<div class="llena-param-row">
+				<div class="llena-param-meta">
+					<span class="llena-param-name">manifiesto</span>
+					<span class="llena-param-loc">FILE</span>
+					<span class="llena-param-type">json</span>
+					<span class="llena-param-req">*</span>
+				</div>
+				<div class="llena-file-area">
+					{#if cargaFile}
+						<span class="llena-file-info">
+							<span class="bb-file-name">{cargaFile.name}</span>
+							<span class="bb-file-size">{(cargaFile.size / 1024).toFixed(1)} KB</span>
+							<button class="bb-file-remove" onclick={cargaRemoveFile}>&times;</button>
+						</span>
+					{:else}
+						<label class="llena-file-btn">
+							Seleccionar archivo
+							<input type="file" accept=".json,application/json" class="bb-file-input" bind:this={cargaFileInput} onchange={cargarManifiesto} />
+						</label>
+					{/if}
+				</div>
+			</div>
+		</div>
+		{#if cargaError}
+			<div class="pruebas-error">{cargaError}</div>
+		{/if}
+	</div>
+	{/if}
+
 	{#if pruebasSubtab === 'llena'}
 	<div class="pruebas-form">
 		<div class="pruebas-row">
 			<span class="pruebas-label">Plantilla (JSON de /manifiesto)</span>
-			<textarea class="pruebas-textarea" bind:value={llenaTemplate} placeholder='Pega aquí el JSON de la plantilla...' rows="8"></textarea>
+			<textarea class="pruebas-textarea" bind:this={llenaTemplateEl} bind:value={llenaTemplate} placeholder='Pega aquí el JSON de la plantilla...' rows="4" oninput={(e) => { const t = e.currentTarget; t.style.height = 'auto'; t.style.height = (t.scrollHeight + 4) + 'px'; }}></textarea>
+			{#if llenaTemplate.trim() && !llenaFromCarga}
+				<button class="btn-io" style="margin-top: 6px;" onclick={() => { const blob = new Blob([llenaTemplate], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'plantilla-manifiesto.json'; a.click(); URL.revokeObjectURL(url); }}>⬇ Descargar Plantilla</button>
+			{/if}
 		</div>
 		<div class="pruebas-row">
 			<span class="pruebas-label">Body Type</span>
 			<span class="pruebas-badge-bodytype">{llenaBodyType}</span>
 		</div>
+		{#if llenaParams.length > 0}
 		<div class="pruebas-row">
-			<span class="pruebas-label">Values (JSON con los valores)</span>
-			<textarea class="pruebas-textarea" bind:value={llenaValues} placeholder={'{"param1": "valor1", "param2": "valor2"}'} rows="4"></textarea>
+			<span class="pruebas-label">Values</span>
+			<div class="llena-params">
+				{#each llenaParams as param}
+				<div class="llena-param-row">
+					<div class="llena-param-meta">
+						<span class="llena-param-name">{param.name}</span>
+						<span class="llena-param-loc">{param.location}</span>
+						<span class="llena-param-type">{param.type}</span>
+						{#if param.required}<span class="llena-param-req">*</span>{/if}
+					</div>
+					{#if param.type === 'boolean'}
+						<select class="llena-input" bind:value={llenaParamValues[param.name]}>
+							<option value="">—</option>
+							<option value="true">true</option>
+							<option value="false">false</option>
+						</select>
+					{:else if param.type === 'integer' || param.type === 'number'}
+						<input class="llena-input" type="number" bind:value={llenaParamValues[param.name]} placeholder="0" />
+					{:else if isFileParam(param)}
+						<div class="llena-file-area">
+							{#if llenaFiles[param.name]}
+								<span class="llena-file-info">
+									<span class="bb-file-name">{llenaFiles[param.name].name}</span>
+									<span class="bb-file-size">{(llenaFiles[param.name].size / 1024).toFixed(1)} KB</span>
+									<button class="bb-file-remove" onclick={() => llenaRemoveFile(param.name)}>&times;</button>
+								</span>
+							{:else}
+								<label class="llena-file-btn">
+									Seleccionar archivo
+									<input type="file" class="bb-file-input" onchange={(e) => llenaHandleFile(param.name, e)} />
+								</label>
+							{/if}
+						</div>
+					{:else}
+						<input class="llena-input" type="text" bind:value={llenaParamValues[param.name]} placeholder={param.description ?? ''} />
+					{/if}
+				</div>
+				{/each}
+			</div>
 		</div>
+		{:else if llenaTemplate.trim()}
+		<p class="pruebas-empty">La plantilla no tiene parámetros.</p>
+		{/if}
 		<div class="pruebas-actions">
 			<button class="btn-manifiesto" onclick={ejecutarLlena} disabled={llenaLoading}>
 				{llenaLoading ? 'Llenando...' : 'Llenar Manifiesto'}
@@ -733,15 +1407,189 @@
 		{/if}
 		{#if llenaResult}
 			<pre class="pruebas-json">{JSON.stringify(llenaResult, null, 2)}</pre>
+			<div class="pruebas-actions">
+				<button class="btn-manifiesto" onclick={() => { subtabUnlocked.blackbox = true; pruebasSubtab = 'blackbox'; }}>Enviar a Api Blackbox</button>
+			</div>
+		{/if}
+	</div>
+	{/if}
+
+	{#if pruebasSubtab === 'blackbox'}
+	<div class="pruebas-form">
+		<div class="pruebas-row">
+			<span class="pruebas-label">Manifiesto (JSON lleno)</span>
+			<textarea class="pruebas-textarea" bind:this={bbManifiestoEl} bind:value={bbManifiesto} placeholder='Pega aquí el manifiesto completo...' rows="4" oninput={(e) => { const t = e.currentTarget; t.style.height = 'auto'; t.style.height = (t.scrollHeight + 4) + 'px'; }}></textarea>
+		</div>
+		{#if bbManifiesto.trim()}
+		{@const parsed = (() => { try { return JSON.parse(bbManifiesto.trim()); } catch { return null; } })()}
+		{#if parsed?.files?.length > 0}
+		<div class="pruebas-row">
+			<span class="pruebas-label">Archivos ({parsed.files.length})</span>
+			<div class="llena-params">
+				{#each parsed.files as fref}
+				<div class="llena-param-row">
+					<div class="llena-param-meta">
+						<span class="llena-param-name">{fref.field_name}</span>
+						<span class="llena-param-loc">file</span>
+						<span class="llena-param-type">{fref.filename}</span>
+					</div>
+					<div class="llena-file-area">
+						{#if bbFiles[fref.field_name]}
+							<span class="llena-file-info">
+								<span class="bb-file-name">{bbFiles[fref.field_name].name}</span>
+								<span class="bb-file-size">{(bbFiles[fref.field_name].size / 1024).toFixed(1)} KB</span>
+								<button class="bb-file-remove" onclick={() => bbRemoveFile(fref.field_name)}>&times;</button>
+							</span>
+						{:else}
+							<label class="llena-file-btn">
+								Seleccionar archivo
+								<input type="file" class="bb-file-input" onchange={(e) => bbHandleFile(fref.field_name, e)} />
+							</label>
+						{/if}
+					</div>
+				</div>
+				{/each}
+			</div>
+		</div>
+		{/if}
+		{/if}
+		<div class="pruebas-actions">
+			<button class="btn-manifiesto" onclick={bbEjecutar} disabled={bbLoading}>
+				{bbLoading ? 'Ejecutando...' : 'Ejecutar'}
+			</button>
+		</div>
+		{#if bbError}
+			<div class="pruebas-error">{bbError}</div>
+		{/if}
+		{#if bbResult}
+			<span class="pruebas-label" style="margin-top: 16px;">Resultado</span>
+		{/if}
+		{#if bbResult && bbResultType === 'image'}
+			<div class="bb-response-image">
+				<img src={bbResultImageUrl} alt="Response" />
+			</div>
+		{/if}
+		{#if bbResult && bbResultType === 'json'}
+			<pre class="pruebas-json">{JSON.stringify(bbResult, null, 2)}</pre>
+		{/if}
+		{#if bbResult && bbResultType === 'text'}
+			<pre class="pruebas-json">{bbResult}</pre>
 		{/if}
 	</div>
 	{/if}
 
 	{#if pruebasSubtab === 'construye'}
 	<div class="pruebas-form">
-		<p class="pruebas-empty">Próximamente...</p>
+		<div class="pruebas-row">
+			<span class="pruebas-label">OpenAPI URL</span>
+			<input class="pruebas-input" bind:value={construyeUrl} placeholder="https://...openapi.json" />
+		</div>
+		<div class="pruebas-row">
+			<span class="pruebas-label">Endpoint</span>
+			<div class="pruebas-endpoint-row">
+				<button class="btn-list btn-list--sm" onclick={listarEndpointsConstruye}>Listar</button>
+				{#if construyeEndpoints.length > 0}
+					<div class="ep-dropdown" class:open={construyeDropdownOpen}>
+						<div class="ep-sizer" aria-hidden="true">
+							{#each construyeEndpoints as ep}
+								<div class="ep-option"><span class="ep-badge">{ep.method.toUpperCase()}</span><span>{ep.path}</span></div>
+							{/each}
+						</div>
+						<button class="ep-trigger" onclick={() => construyeDropdownOpen = !construyeDropdownOpen}>
+							{#if construyeSelectedEp}
+								<span class="ep-badge method-{construyeSelectedEp.method.toLowerCase()}">{construyeSelectedEp.method.toUpperCase()}</span><span class="ep-trigger-path">{construyeSelectedEp.path}</span>
+							{:else}
+								<span class="ep-placeholder">— Seleccionar endpoint —</span>
+							{/if}
+							<span class="ep-arrow">{construyeDropdownOpen ? '▴' : '▾'}</span>
+						</button>
+						{#if construyeDropdownOpen}
+							<div class="ep-list">
+								{#each construyeEndpoints as ep}
+									<button class="ep-option" onclick={() => selectConstruyeEndpoint(ep)}>
+										<span class="ep-badge method-{ep.method.toLowerCase()}">{ep.method.toUpperCase()}</span>
+										<span class="ep-option-path">{ep.path}</span>
+									</button>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{:else}
+					<input class="pruebas-input pruebas-input--short" bind:value={construyePath} placeholder="/endpoint" />
+				{/if}
+			</div>
+		</div>
+		<div class="pruebas-row">
+			<span class="pruebas-label">Body Type</span>
+			<span class="pruebas-badge-bodytype">{construyeBodyType}</span>
+		</div>
+		{#if construyeParams.length > 0}
+		<div class="pruebas-row">
+			<span class="pruebas-label">Values</span>
+			<div class="llena-params">
+				{#each construyeParams as param}
+				<div class="llena-param-row">
+					<div class="llena-param-meta">
+						<span class="llena-param-name">{param.name}</span>
+						<span class="llena-param-loc">{param.location}</span>
+						<span class="llena-param-type">{param.type}</span>
+						{#if param.required}<span class="llena-param-req">*</span>{/if}
+					</div>
+					{#if param.type === 'boolean'}
+						<select class="llena-input" bind:value={construyeParamValues[param.name]}>
+							<option value="">—</option>
+							<option value="true">true</option>
+							<option value="false">false</option>
+						</select>
+					{:else if param.type === 'integer' || param.type === 'number'}
+						<input class="llena-input" type="number" bind:value={construyeParamValues[param.name]} placeholder="0" />
+					{:else if isConstruyeFileParam(param)}
+						<div class="llena-file-area">
+							{#if construyeFiles[param.name]}
+								<span class="llena-file-info">
+									<span class="bb-file-name">{construyeFiles[param.name].name}</span>
+									<span class="bb-file-size">{(construyeFiles[param.name].size / 1024).toFixed(1)} KB</span>
+									<button class="bb-file-remove" onclick={() => construyeRemoveFile(param.name)}>&times;</button>
+								</span>
+							{:else}
+								<label class="llena-file-btn">
+									Seleccionar archivo
+									<input type="file" class="bb-file-input" onchange={(e) => construyeHandleFile(param.name, e)} />
+								</label>
+							{/if}
+						</div>
+					{:else}
+						<input class="llena-input" type="text" bind:value={construyeParamValues[param.name]} placeholder={param.description ?? ''} />
+					{/if}
+				</div>
+				{/each}
+			</div>
+		</div>
+		{:else if construyeSelectedEp && !construyeTemplate.trim()}
+		<p class="pruebas-empty">Cargando parámetros...</p>
+		{:else if construyeSelectedEp && construyeTemplate.trim()}
+		<p class="pruebas-empty">El endpoint no tiene parámetros.</p>
+		{/if}
+		<div class="pruebas-actions">
+			<button class="btn-manifiesto" onclick={ejecutarConstruye} disabled={construyeLoading}>
+				{construyeLoading ? 'Construyendo...' : 'Construir'}
+			</button>
+			{#if construyeResult}
+				<button class="btn-io" onclick={descargarConstruye}>⬇ Descargar JSON</button>
+			{/if}
+		</div>
+		{#if construyeError}
+			<div class="pruebas-error">{construyeError}</div>
+		{/if}
+		{#if construyeResult}
+			<pre class="pruebas-json">{JSON.stringify(construyeResult, null, 2)}</pre>
+			<div class="pruebas-actions">
+				<button class="btn-manifiesto" onclick={() => { subtabUnlocked.blackbox = true; pruebasSubtab = 'blackbox'; }}>Enviar a Api Blackbox</button>
+			</div>
+		{/if}
 	</div>
 	{/if}
+	</div>
 </div>
 {/if}
 
@@ -1066,44 +1914,182 @@
 	}
 
 	.pruebas-workspace {
-		overflow-y: auto;
-		padding: 20px 40px;
+		box-sizing: border-box;
+		overflow: visible;
+		padding: 30px 40px;
 		display: flex;
 		flex-direction: column;
 	}
 
-	.subtabs-bar {
-		display: flex;
-		gap: 4px;
-		background: rgba(255, 255, 255, 0.06);
-		border: 1px solid rgba(255, 255, 255, 0.12);
-		border-radius: 10px;
-		padding: 3px;
-		width: fit-content;
-		margin-bottom: 20px;
+	.pruebas-content {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
 	}
 
-	.subtab {
+	.subtabs-wrapper {
+		flex-shrink: 0;
+		z-index: 10;
+		margin-bottom: 20px;
+		width: fit-content;
+	}
+
+	.subtabs-flow {
+		position: relative;
+		display: grid;
+		grid-template-columns: auto auto auto;
+		grid-template-rows: auto auto auto;
+		column-gap: 52px;
+		row-gap: 22px;
+		align-items: center;
+	}
+
+	.subtab-grid-manifiesto {
+		grid-column: 1;
+		grid-row: 1;
+	}
+
+	.subtab-grid-carga {
+		grid-column: 1;
+		grid-row: 2;
+	}
+
+	.subtab-grid-llena {
+		grid-column: 2;
+		grid-row: 1 / span 2;
+		align-self: center;
+	}
+
+	.subtab-grid-construye {
+		grid-column: 2;
+		grid-row: 3;
+	}
+
+	.subtab-grid-blackbox {
+		grid-column: 3;
+		grid-row: 1 / span 3;
+		align-self: center;
+	}
+
+	.subtabs-lines {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		pointer-events: none;
+		z-index: 1;
+		overflow: visible;
+	}
+
+	.subtabs-lines :global(path) {
+		stroke: rgba(255, 255, 255, 0.4);
+		stroke-width: 1.5;
+		fill: none;
+	}
+
+	.subtab-node-wrapper {
+		position: relative;
+		z-index: 2;
+	}
+
+	.subtab-node {
 		padding: 6px 18px;
-		background: none;
-		border: none;
-		border-radius: 7px;
+		background: rgba(255, 255, 255, 0.06);
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		border-radius: 10px;
 		color: rgba(255, 255, 255, 0.5);
 		font-family: 'Roboto', sans-serif;
 		font-size: 13px;
 		font-weight: 600;
 		cursor: pointer;
-		transition: background 0.2s, color 0.2s;
+		transition: background 0.2s, color 0.2s, border-color 0.2s;
 		white-space: nowrap;
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
 	}
 
-	.subtab:hover {
+	.subtab-node:hover {
+		background: rgba(255, 255, 255, 0.12);
 		color: rgba(255, 255, 255, 0.8);
 	}
 
-	.subtab.active {
-		background: rgba(255, 255, 255, 0.15);
-		color: white;
+	.subtab-node.active {
+		background: rgba(255, 255, 255, 0.16);
+		color: #fff;
+		border-color: rgba(255, 255, 255, 0.3);
+	}
+
+	.subtab-node.locked {
+		opacity: 0.35;
+		cursor: not-allowed;
+	}
+
+	.subtab-node.locked:hover {
+		background: rgba(255, 255, 255, 0.06);
+		color: rgba(255, 255, 255, 0.5);
+	}
+
+	.subtab-info {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 14px;
+		height: 14px;
+		border-radius: 50%;
+		border: 1px solid rgba(255, 255, 255, 0.3);
+		color: rgba(255, 255, 255, 0.4);
+		font-size: 9px;
+		font-weight: 700;
+		position: absolute;
+		top: -15px;
+		right: -15px;
+		cursor: default;
+		line-height: 1;
+		transition: border-color 0.2s, color 0.2s;
+	}
+
+	.subtab-grid-llena > .subtab-info {
+		top: -5px;
+		right: 0px;
+	}
+
+	.subtab-grid-construye > .subtab-info {
+		top: -15px;
+		right: -15px;
+	}
+
+	.subtab-info::before {
+		content: 'i';
+	}
+
+	.subtab-info:hover {
+		border-color: rgba(255, 255, 255, 0.7);
+		color: rgba(255, 255, 255, 0.9);
+	}
+
+	.subtab-info:hover .subtab-tooltip {
+		display: block;
+	}
+
+	.subtab-tooltip {
+		display: none;
+		position: absolute;
+		bottom: calc(100% + 8px);
+		left: 50%;
+		transform: translateX(-50%);
+		background: rgba(30, 15, 60, 0.95);
+		border: 1px solid rgba(255, 255, 255, 0.2);
+		border-radius: 8px;
+		padding: 8px 12px;
+		color: rgba(255, 255, 255, 0.85);
+		font-size: 12px;
+		font-weight: 400;
+		white-space: normal;
+		width: 200px;
+		z-index: 100;
+		line-height: 1.5;
+		pointer-events: none;
+		backdrop-filter: blur(12px);
 	}
 
 	.subtab-option {
@@ -1142,6 +2128,190 @@
 		letter-spacing: 0.04em;
 	}
 
+	.bb-files-area {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.bb-file-input {
+		display: none;
+	}
+
+	.bb-file-list {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.bb-file-item {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 6px 12px;
+		background: rgba(255, 255, 255, 0.08);
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		border-radius: 6px;
+	}
+
+	.bb-file-name {
+		color: white;
+		font-family: 'Roboto', sans-serif;
+		font-size: 13px;
+		flex: 1;
+	}
+
+	.bb-file-size {
+		color: rgba(255, 255, 255, 0.5);
+		font-size: 11px;
+		font-family: 'Roboto', sans-serif;
+	}
+
+	.bb-file-remove {
+		background: rgba(255, 80, 80, 0.3);
+		border: 1px solid rgba(255, 80, 80, 0.5);
+		color: white;
+		border-radius: 4px;
+		width: 22px;
+		height: 22px;
+		cursor: pointer;
+		font-size: 14px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.bb-file-remove:hover {
+		background: rgba(255, 80, 80, 0.5);
+	}
+
+	.bb-files-empty {
+		color: rgba(255, 255, 255, 0.35);
+		font-family: 'Roboto', sans-serif;
+		font-size: 12px;
+		margin: 0;
+	}
+
+	.bb-response-image {
+		border-radius: 8px;
+		overflow: hidden;
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		max-width: 100%;
+	}
+
+	.bb-response-image img {
+		display: block;
+		max-width: 100%;
+		height: auto;
+	}
+
+	.llena-params {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		width: 100%;
+	}
+
+	.llena-param-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		background: rgba(255, 255, 255, 0.05);
+		border: 1px solid rgba(255, 255, 255, 0.1);
+		border-radius: 8px;
+		padding: 8px 12px;
+	}
+
+	.llena-param-meta {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 200px;
+	}
+
+	.llena-param-name {
+		font-family: 'Roboto', sans-serif;
+		font-size: 13px;
+		font-weight: 600;
+		color: white;
+	}
+
+	.llena-param-loc {
+		font-size: 10px;
+		font-family: 'Roboto', sans-serif;
+		padding: 2px 6px;
+		border-radius: 4px;
+		background: rgba(100, 150, 255, 0.25);
+		color: rgba(180, 200, 255, 0.9);
+		text-transform: uppercase;
+	}
+
+	.llena-param-type {
+		font-size: 10px;
+		font-family: 'Roboto Mono', monospace;
+		color: rgba(255, 255, 255, 0.4);
+	}
+
+	.llena-param-req {
+		color: #ff6b6b;
+		font-size: 14px;
+		font-weight: 700;
+	}
+
+	.llena-input {
+		flex: 1;
+		padding: 6px 10px;
+		background: rgba(255, 255, 255, 0.08);
+		border: 1px solid rgba(255, 255, 255, 0.2);
+		border-radius: 6px;
+		color: white;
+		font-family: 'Roboto', sans-serif;
+		font-size: 13px;
+		outline: none;
+	}
+
+	.llena-input:focus {
+		border-color: rgba(255, 255, 255, 0.45);
+		background: rgba(255, 255, 255, 0.12);
+	}
+
+	.llena-input option {
+		background: #2a1a4a;
+		color: white;
+	}
+
+	.llena-file-area {
+		flex: 1;
+		display: flex;
+		align-items: center;
+	}
+
+	.llena-file-btn {
+		padding: 6px 14px;
+		background: rgba(255, 255, 255, 0.1);
+		border: 1px solid rgba(255, 255, 255, 0.25);
+		border-radius: 6px;
+		color: rgba(255, 255, 255, 0.7);
+		font-family: 'Roboto', sans-serif;
+		font-size: 12px;
+		cursor: pointer;
+		transition: background 0.2s;
+	}
+
+	.llena-file-btn:hover {
+		background: rgba(255, 255, 255, 0.18);
+		color: white;
+	}
+
+	.llena-file-info {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
 	.pruebas-textarea {
 		padding: 10px 14px;
 		background: rgba(255, 255, 255, 0.08);
@@ -1153,8 +2323,9 @@
 		outline: none;
 		backdrop-filter: blur(8px);
 		transition: border-color 0.2s;
-		resize: vertical;
+		resize: none;
 		width: 100%;
+		overflow: hidden;
 	}
 
 	.pruebas-textarea:focus {
@@ -1223,6 +2394,17 @@
 		color: rgba(255, 255, 255, 0.3);
 	}
 
+	.pruebas-file-input {
+		padding: 10px 14px;
+		background: rgba(255, 255, 255, 0.08);
+		color: white;
+		border: 1px solid rgba(255, 255, 255, 0.25);
+		border-radius: 8px;
+		font-size: 14px;
+		font-family: 'Roboto', sans-serif;
+		cursor: pointer;
+	}
+
 	.pruebas-input--short {
 		flex: 1;
 	}
@@ -1289,8 +2471,8 @@
 		white-space: pre-wrap;
 		word-break: break-word;
 		border: 1px solid rgba(255, 255, 255, 0.1);
-		max-height: 400px;
-		overflow-y: auto;
+		max-height: none;
+		overflow-y: visible;
 	}
 
 	.connections {
@@ -1304,8 +2486,9 @@
 
 	.box {
 		position: absolute;
-		width: 250px;
-		height: 250px;
+		width: 280px;
+		min-height: 250px;
+		height: auto;
 		background: white;
 		border-radius: 12px;
 		cursor: grab;
@@ -1315,8 +2498,6 @@
 	}
 
 	.box-content {
-		position: absolute;
-		inset: 0;
 		display: flex;
 		flex-direction: column;
 		align-items: flex-start;
@@ -1324,6 +2505,7 @@
 		overflow: hidden;
 		overflow-y: auto;
 		padding: 10px;
+		max-height: 400px;
 	}
 
 	.box-method {
@@ -1537,6 +2719,155 @@
 	.box.dragging {
 		cursor: grabbing;
 		box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+	}
+
+	/* --- Preparar button --- */
+	.box-preparar {
+		margin-top: 8px;
+		width: 100%;
+		padding: 6px 0;
+		background: #7c3aed;
+		color: white;
+		border: none;
+		border-radius: 6px;
+		font-size: 11px;
+		font-weight: 700;
+		font-family: 'Roboto', sans-serif;
+		cursor: pointer;
+		transition: background 0.2s;
+		letter-spacing: 0.3px;
+	}
+
+	.box-preparar:hover:not(:disabled) {
+		background: #6d28d9;
+	}
+
+	.box-preparar:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.box-preparar.loading {
+		background: #a78bfa;
+		animation: pulse-preparar 1s ease-in-out infinite;
+	}
+
+	@keyframes pulse-preparar {
+		0%, 100% { opacity: 0.7; }
+		50% { opacity: 1; }
+	}
+
+	/* --- Status badge --- */
+	.box-status-badge {
+		position: absolute;
+		top: -8px;
+		right: 20px;
+		width: 22px;
+		height: 22px;
+		border-radius: 50%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 13px;
+		font-weight: 700;
+		z-index: 20;
+		pointer-events: auto;
+		border: 2px solid white;
+	}
+
+	.box-status-ready {
+		background: #4caf50;
+		color: white;
+	}
+
+	.box-download-badge {
+		position: absolute;
+		top: -8px;
+		right: -6px;
+		width: 22px;
+		height: 22px;
+		border-radius: 50%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 13px;
+		font-weight: 700;
+		z-index: 20;
+		background: #fff;
+		border: 2px solid #2196f3;
+		color: #2196f3;
+		cursor: pointer;
+		padding: 0;
+		line-height: 1;
+		transition: transform 0.15s;
+	}
+
+	.box-download-badge:hover {
+		transform: scale(1.15);
+	}
+
+	.box-status-error {
+		background: #f44336;
+		color: white;
+		cursor: help;
+	}
+
+	.box-status-loading {
+		background: #a78bfa;
+		color: white;
+		animation: spin-badge 1s linear infinite;
+	}
+
+	@keyframes spin-badge {
+		0% { transform: rotate(0deg); }
+		100% { transform: rotate(360deg); }
+	}
+
+	/* --- Box file UI --- */
+	.box-file-info {
+		flex: 1;
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		min-width: 0;
+	}
+
+	.box-file-name {
+		font-size: 10px;
+		color: #333;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 100px;
+	}
+
+	.box-file-size {
+		font-size: 9px;
+		color: #888;
+		white-space: nowrap;
+	}
+
+	.box-file-remove {
+		background: none;
+		border: none;
+		color: #e53935;
+		font-size: 14px;
+		cursor: pointer;
+		padding: 0 2px;
+		line-height: 1;
+	}
+
+	.box-file-btn {
+		flex: 1;
+		font-size: 10px;
+		color: #7c3aed;
+		cursor: pointer;
+		font-family: 'Roboto', sans-serif;
+		font-weight: 600;
+	}
+
+	.box-file-hidden {
+		display: none;
 	}
 
 	.dot {
