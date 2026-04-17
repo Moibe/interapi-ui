@@ -124,6 +124,22 @@
 		dropdownOpen = false;
 	}
 
+	async function downloadEndpointJson() {
+		if (!testSpecUrl.trim() || !selectedEndpoint) return;
+		try {
+			const result = await parseOpenAPI(testSpecUrl.trim(), selectedEndpoint.path, selectedEndpoint.method);
+			const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `endpoint-${selectedEndpoint.method}-${selectedEndpoint.path.replace(/\//g, '_')}.json`;
+			a.click();
+			URL.revokeObjectURL(url);
+		} catch (error) {
+			console.error('Error descargando endpoint JSON:', error);
+		}
+	}
+
 	async function testOpenAPIParser() {
 		if (!testSpecUrl.trim()) { console.warn('[OpenAPI] Ingresa una URL de spec.'); return; }
 		console.log('Testing OpenAPI Parser...');
@@ -181,6 +197,13 @@
 	let offsetY = 0;
 	let boxEls: Record<number, HTMLDivElement> = {};
 	let workspaceEl: HTMLDivElement;
+
+	// Group selection & drag
+	let selectedIds = $state<Set<number>>(new Set());
+	let dragOffsets: Record<number, { dx: number; dy: number }> = {};
+	let lassoActive = $state(false);
+	let lassoStart = { x: 0, y: 0 };
+	let lassoEnd = $state({ x: 0, y: 0 });
 
 	// Wire dragging
 	let wiringFromId = $state<number | null>(null);
@@ -291,6 +314,19 @@
 		offsetY = e.clientY - boxRect.top;
 		target.setPointerCapture(e.pointerId);
 
+		// Group drag: compute relative offsets for selected boxes
+		if (selectedIds.has(box.id) && selectedIds.size > 1) {
+			dragOffsets = {};
+			for (const sid of selectedIds) {
+				const sb = boxes.find(b => b.id === sid);
+				if (sb) dragOffsets[sid] = { dx: sb.x - box.x, dy: sb.y - box.y };
+			}
+		} else {
+			// Single drag: clear group selection
+			selectedIds = new Set();
+			dragOffsets = {};
+		}
+
 		animate(boxEls[box.id], {
 			scale: [1, 1.08],
 			boxShadow: [
@@ -305,13 +341,32 @@
 	function onPointerMove(e: PointerEvent, box: Box) {
 		if (draggingId !== box.id) return;
 		const wsRect = workspaceEl.getBoundingClientRect();
-		box.x = clamp(e.clientX - wsRect.left - offsetX, 0, wsRect.width - BOX_SIZE);
-		box.y = clamp(e.clientY - wsRect.top - offsetY, 0, wsRect.height - BOX_SIZE);
+		const newX = clamp(e.clientX - wsRect.left - offsetX, 0, wsRect.width - BOX_SIZE);
+		const newY = clamp(e.clientY - wsRect.top - offsetY, 0, wsRect.height - BOX_SIZE);
+		box.x = newX;
+		box.y = newY;
+
+		// Move all other selected boxes with their relative offsets
+		if (selectedIds.has(box.id) && selectedIds.size > 1) {
+			for (const sid of selectedIds) {
+				if (sid === box.id) continue;
+				const sb = boxes.find(b => b.id === sid);
+				const off = dragOffsets[sid];
+				if (sb && off) {
+					const el = boxEls[sid];
+					const bw = el ? el.offsetWidth : BOX_SIZE;
+					const bh = el ? el.offsetHeight : BOX_SIZE;
+					sb.x = clamp(newX + off.dx, 0, wsRect.width - bw);
+					sb.y = clamp(newY + off.dy, 0, wsRect.height - bh);
+				}
+			}
+		}
 	}
 
 	function onPointerUp(box: Box) {
 		if (draggingId !== box.id) return;
 		draggingId = null;
+		dragOffsets = {};
 		animate(boxEls[box.id], {
 			scale: [1.15, 1],
 			boxShadow: [
@@ -332,7 +387,25 @@
 		wireEnd = { x: e.clientX - wsRect.left, y: e.clientY - wsRect.top };
 	}
 
+	function onWorkspacePointerDown(e: PointerEvent) {
+		if (e.button !== 0) return;
+		// Only start lasso if clicking on the workspace itself (not a box or dot)
+		if ((e.target as HTMLElement).closest('.box') || (e.target as HTMLElement).closest('.dot')) return;
+		const wsRect = workspaceEl.getBoundingClientRect();
+		const x = e.clientX - wsRect.left;
+		const y = e.clientY - wsRect.top;
+		lassoActive = true;
+		lassoStart = { x, y };
+		lassoEnd = { x, y };
+		selectedIds = new Set();
+	}
+
 	function onWorkspacePointerMove(e: PointerEvent) {
+		if (lassoActive) {
+			const wsRect = workspaceEl.getBoundingClientRect();
+			lassoEnd = { x: e.clientX - wsRect.left, y: e.clientY - wsRect.top };
+			return;
+		}
 		if (wiringFromId === null) return;
 		const wsRect = workspaceEl.getBoundingClientRect();
 		wireEnd = { x: e.clientX - wsRect.left, y: e.clientY - wsRect.top };
@@ -353,6 +426,24 @@
 	}
 
 	function onWorkspacePointerUp() {
+		if (lassoActive) {
+			lassoActive = false;
+			const x1 = Math.min(lassoStart.x, lassoEnd.x);
+			const y1 = Math.min(lassoStart.y, lassoEnd.y);
+			const x2 = Math.max(lassoStart.x, lassoEnd.x);
+			const y2 = Math.max(lassoStart.y, lassoEnd.y);
+			const newSelection = new Set<number>();
+			for (const box of boxes) {
+				const el = boxEls[box.id];
+				const bw = el ? el.offsetWidth : BOX_SIZE;
+				const bh = el ? el.offsetHeight : BOX_SIZE;
+				if (box.x + bw > x1 && box.x < x2 && box.y + bh > y1 && box.y < y2) {
+					newSelection.add(box.id);
+				}
+			}
+			selectedIds = newSelection;
+			return;
+		}
 		wiringFromId = null;
 	}
 
@@ -1063,6 +1154,7 @@
 				{/if}
 			</div>
 			<button class="btn-create" onclick={testOpenAPIParser}>Agregar Endpoint</button>
+			<button class="btn-io" onclick={downloadEndpointJson} title="Descargar JSON del endpoint">↓</button>
 		{/if}
 	{/if}
 	<div class="toolbar-spacer"></div>
@@ -1073,6 +1165,7 @@
 <div
 	class="workspace"
 	bind:this={workspaceEl}
+	onpointerdown={onWorkspacePointerDown}
 	onpointermove={onWorkspacePointerMove}
 	onpointerup={onWorkspacePointerUp}
 	oncontextmenu={(e) => e.preventDefault()}
@@ -1091,6 +1184,7 @@
 		<div
 			class="box"
 			class:dragging={draggingId === box.id}
+			class:selected={selectedIds.has(box.id)}
 			style="left: {box.x}px; top: {box.y}px; z-index: {box.id};"
 			bind:this={boxEls[box.id]}
 			onpointerdown={(e) => onPointerDown(e, box)}
@@ -1213,6 +1307,9 @@
 			></span>
 		</div>
 	{/each}
+	{#if lassoActive}
+		<div class="lasso" style="left:{Math.min(lassoStart.x, lassoEnd.x)}px;top:{Math.min(lassoStart.y, lassoEnd.y)}px;width:{Math.abs(lassoEnd.x - lassoStart.x)}px;height:{Math.abs(lassoEnd.y - lassoStart.y)}px;"></div>
+	{/if}
 </div>
 
 {/if}
@@ -2719,6 +2816,21 @@
 	.box.dragging {
 		cursor: grabbing;
 		box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+	}
+
+	.box.selected {
+		outline: 2px solid cornflowerblue;
+		outline-offset: 2px;
+	}
+
+	/* --- Lasso selection --- */
+	.lasso {
+		position: absolute;
+		border: 1.5px dashed rgba(100, 149, 237, 0.8);
+		background: rgba(100, 149, 237, 0.12);
+		pointer-events: none;
+		z-index: 50;
+		border-radius: 2px;
 	}
 
 	/* --- Preparar button --- */
